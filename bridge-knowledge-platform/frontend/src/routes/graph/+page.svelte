@@ -1,21 +1,33 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Search, Filter, Maximize2, Download, RefreshCw, Settings, FileText, Trash2, Eye } from 'lucide-svelte';
+	import { Search, Filter, Maximize2, Download, RefreshCw, Settings, FileText, Trash2, Eye, Zap } from 'lucide-svelte';
+	import KnowledgeGraph from '$lib/components/KnowledgeGraph.svelte';
+	import type { ElementDefinition } from 'cytoscape';
 	
-	let graphContainer: HTMLDivElement;
+	let graphContainer: HTMLDivElement; // This might not be needed if KnowledgeGraph handles its own container
 	let searchQuery = $state('');
-	let selectedNode: any = $state(null);
-	let isLoading = $state(false);
-	let searchResults = $state([]);
+	let selectedNodeInfo: any = $state(null); // For displaying details of node clicked in graph or search
+	let isLoading = $state(true); // Start with loading true
+	let searchResults = $state<any[]>([]);
 	let selectedDocumentId = $state<string | null>(null);
 	
-	// 真实的图数据，从API获取
-	let graphData = $state({
+	// Cytoscape elements
+	let graphElements = $state<ElementDefinition[]>([]);
+
+	// Raw graph data from API, to be transformed
+	let rawGraphData = $state<{ nodes: any[], edges: any[] }>({
 		nodes: [],
 		edges: []
 	});
 	
-	let nodeTypes = $state<Array<{type: string, label: string, color: string, count: number}>>([]);
+	let nodeTypes = $state<Array<{type: string, label: string, color: string, count: number}>>([
+		// Default/fallback node types
+		{ type: 'concept', label: '概念', color: '#3B82F6', count: 0 },
+		{ type: 'material', label: '材料', color: '#10B981', count: 0 },
+		{ type: 'component', label: '构件', color: '#F59E0B', count: 0 },
+		{ type: 'type', label: '类型', color: '#8B5CF6', count: 0 },
+		{ type: 'property', label: '属性', color: '#EF4444', count: 0 }
+	]);
 	let graphStats = $state({
 		totalNodes: 0,
 		totalRelations: 0,
@@ -116,15 +128,52 @@
 				
 				// 如果有图数据，更新图数据
 				if (healthData.graph_data) {
-					graphData.nodes = healthData.graph_data.nodes || [];
-					graphData.edges = healthData.graph_data.edges || [];
+					rawGraphData.nodes = healthData.graph_data.nodes || [];
+					rawGraphData.edges = healthData.graph_data.edges || [];
+					transformGraphData();
+				} else {
+					// Clear graph if no data
+					rawGraphData.nodes = [];
+					rawGraphData.edges = [];
+					transformGraphData();
 				}
 			}
 		} catch (error) {
 			console.error('获取知识图谱数据失败:', error);
+			rawGraphData.nodes = []; // Clear on error too
+			rawGraphData.edges = [];
+			transformGraphData();
 		} finally {
 			isLoading = false;
 		}
+	}
+
+	function transformGraphData() {
+		const newElements: ElementDefinition[] = [];
+		rawGraphData.nodes.forEach(node => {
+			newElements.push({
+				group: 'nodes',
+				data: {
+					id: node.id || node.element_id, // Adapt based on actual API response
+					label: node.properties?.name || node.properties?.label || node.id, // Adapt
+					type: node.labels?.[0] || 'unknown', // Get first label as type
+					properties: node.properties
+				},
+			});
+		});
+		rawGraphData.edges.forEach(edge => {
+			newElements.push({
+				group: 'edges',
+				data: {
+					id: edge.id || edge.element_id,
+					source: edge.start_node_id || edge.source,
+					target: edge.end_node_id || edge.target,
+					label: edge.type || edge.label, // API might use 'type' or 'label' for relation type
+					properties: edge.properties
+				},
+			});
+		});
+		graphElements = newElements;
 	}
 	
 	let filterOptions = $state({
@@ -136,52 +185,89 @@
 	});
 	
 	async function handleSearch() {
-		if (!searchQuery.trim()) return;
+		if (!searchQuery.trim()) {
+			searchResults = []; // Clear results if search query is empty
+			return;
+		}
 		
+		isLoading = true;
 		try {
-			isLoading = true;
 			const response = await fetch('/api/v1/knowledge/search', {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({
-					query: searchQuery,
-					limit: 50
-				})
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ query: searchQuery, limit: 20 })
 			});
 			
 			if (response.ok) {
 				const result = await response.json();
-				searchResults = result.entities || [];
-				console.log('搜索结果:', result);
+				// Assuming result.entities is an array of nodes like those in rawGraphData.nodes
+				searchResults = (result.entities || []).map((entity: any) => ({
+					id: entity.id || entity.element_id,
+					label: entity.properties?.name || entity.properties?.label || entity.id,
+					type: entity.labels?.[0] || 'unknown',
+					properties: entity.properties
+				}));
+				console.log('搜索结果:', searchResults);
+			} else {
+				searchResults = [];
+				console.error('搜索API错误:', response.status, await response.text());
 			}
 		} catch (error) {
+			searchResults = [];
 			console.error('搜索失败:', error);
 		} finally {
 			isLoading = false;
 		}
 	}
+
+	function handleSearchResultClick(node: any) {
+		selectedNodeInfo = node; // Display node info
+		// Future: Add interaction with KnowledgeGraph component to highlight/center this node
+		// e.g., by calling a method on the component instance or binding a prop
+		console.log('Search result clicked:', node);
+		// Example: if KnowledgeGraph component has a method `centerOnNode(nodeId)`
+		// knowledgeGraphInstance?.centerOnNode(node.id);
+	}
+
+	function handleNodeClickFromGraph(event: CustomEvent) {
+		const nodeData = event.detail.node;
+		selectedNodeInfo = {
+			id: nodeData.id,
+			label: nodeData.label,
+			type: nodeData.type,
+			properties: nodeData.properties
+			// Add other relevant details from nodeData as needed
+		};
+		console.log('Node clicked in graph:', selectedNodeInfo);
+	}
 	
 	function resetGraph() {
-		// 重置图谱视图
 		selectedDocumentId = null;
-		fetchGraphData();
-		console.log('Resetting graph');
+		searchQuery = '';
+		searchResults = [];
+		selectedNodeInfo = null;
+		fetchGraphData(); // This will refetch and transform data
+		console.log('Resetting graph view');
 	}
 	
 	function exportGraph() {
-		// 导出图谱
 		console.log('Exporting graph');
+		// This would likely involve taking `rawGraphData` or `graphElements`
+		// and formatting them (e.g., as JSON, CSV, GraphML) then triggering a download.
+		// Placeholder for now.
 	}
 	
+	let knowledgeGraphInstance: KnowledgeGraph; // To call methods on the component if needed
+
 	function toggleFullscreen() {
-		// 切换全屏
-		if (graphContainer) {
-			if (document.fullscreenElement) {
-				document.exitFullscreen();
+		const graphElement = document.querySelector('#graph-visualization-area'); // Target the graph area
+		if (graphElement) {
+			if (!document.fullscreenElement) {
+				graphElement.requestFullscreen().catch(err => {
+					alert(`全屏模式错误: ${err.message} (${err.name})`);
+				});
 			} else {
-				graphContainer.requestFullscreen();
+				document.exitFullscreen();
 			}
 		}
 	}
@@ -232,9 +318,9 @@
 	<title>知识图谱 - 桥梁知识图谱平台</title>
 </svelte:head>
 
-<div class="h-[calc(100vh-8rem)] flex gap-6">
+<div class="md:h-[calc(100vh-8rem)] flex flex-col md:flex-row gap-6">
 	<!-- 左侧控制面板 -->
-	<div class="w-80 bg-white rounded-xl border border-gray-200 p-6 overflow-y-auto">
+	<div class="w-full md:w-80 bg-white rounded-xl border border-gray-200 p-6 overflow-y-auto md:h-full shrink-0"> {{!-- Added shrink-0 for md+ --}}
 		<!-- 搜索 -->
 		<div class="mb-6">
 			<h3 class="text-lg font-semibold text-gray-900 mb-3">搜索图谱</h3>
@@ -254,6 +340,28 @@
 			>
 				搜索
 			</button>
+
+			<!-- Search Results -->
+			{#if searchResults.length > 0}
+				<div class="mt-4 border-t border-gray-200 pt-4 max-h-60 overflow-y-auto">
+					<h4 class="text-sm font-semibold text-gray-700 mb-2">搜索结果 ({searchResults.length})</h4>
+					<ul class="space-y-1">
+						{#each searchResults as result (result.id)}
+							<li>
+								<button
+									onclick={() => handleSearchResultClick(result)}
+									class="w-full text-left p-2 rounded-md hover:bg-gray-100 focus:outline-none focus:bg-gray-100 transition-colors duration-150"
+								>
+									<div class="text-sm font-medium text-blue-600 truncate">{result.label}</div>
+									<div class="text-xs text-gray-500">{result.type}</div>
+								</button>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{:else if isLoading && searchQuery.trim()}
+				<div class="mt-4 text-center text-sm text-gray-500">正在搜索...</div>
+			{/if}
 		</div>
 
 		<!-- 文档管理 -->
@@ -370,15 +478,34 @@
 		</div>
 
 		<!-- 选中节点信息 -->
-		{#if selectedNode}
+		{#if selectedNodeInfo}
 			<div class="mb-6">
 				<h3 class="text-lg font-semibold text-gray-900 mb-3">节点详情</h3>
-				<div class="bg-gray-50 rounded-lg p-4">
-					<h4 class="font-medium text-gray-900 mb-2">{selectedNode.label}</h4>
-					<div class="space-y-1 text-sm text-gray-600">
-						<div>类型: <span class="font-medium">{selectedNode.type}</span></div>
-						<div>度: <span class="font-medium">{selectedNode.degree || 0}</span></div>
+				<div class="bg-gray-50 rounded-lg p-4 text-sm space-y-2">
+					<div>
+						<span class="font-medium text-gray-700">名称:</span>
+						<span class="text-gray-900 ml-1">{selectedNodeInfo.label || selectedNodeInfo.name || 'N/A'}</span>
 					</div>
+					<div>
+						<span class="font-medium text-gray-700">类型:</span>
+						<span class="text-gray-900 ml-1">{selectedNodeInfo.type || 'N/A'}</span>
+					</div>
+					{#if selectedNodeInfo.properties}
+						<div class="pt-1 mt-1 border-t">
+							<h5 class="font-medium text-gray-700 mb-1">属性:</h5>
+							<ul class="space-y-1 max-h-32 overflow-y-auto">
+								{#each Object.entries(selectedNodeInfo.properties) as [key, value]}
+									<li class="text-xs">
+										<span class="font-semibold text-gray-600">{key}:</span>
+										<span class="text-gray-800 ml-1 truncate">{value}</span>
+									</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+					{#if !selectedNodeInfo.properties || Object.keys(selectedNodeInfo.properties).length === 0}
+						<p class="text-xs text-gray-500">无更多属性信息。</p>
+					{/if}
 				</div>
 			</div>
 		{/if}
@@ -403,7 +530,7 @@
 	</div>
 
 	<!-- 右侧图谱可视化区域 -->
-	<div class="flex-1 bg-white rounded-xl border border-gray-200 relative overflow-hidden">
+	<div class="flex-1 bg-white rounded-xl border border-gray-200 relative overflow-hidden min-h-[400px] md:min-h-0"> {{!-- min-height for stacked view --}}
 		<!-- 工具栏 -->
 		<div class="absolute top-4 right-4 z-10 flex space-x-2">
 			<button
@@ -422,43 +549,50 @@
 		</div>
 
 		<!-- 图谱容器 -->
-		<div 
-			bind:this={graphContainer}
-			class="w-full h-full flex items-center justify-center bg-gradient-to-br from-gray-50 to-white"
-		>
-			<!-- 占位符 - 实际使用时会被图可视化库替换 -->
-			<div class="text-center">
-				<div class="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center mx-auto mb-4">
-					<svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
-					</svg>
+		<div id="graph-visualization-area" class="w-full h-full bg-gradient-to-br from-gray-50 to-white relative">
+			{#if isLoading && graphElements.length === 0}
+				<div class="absolute inset-0 flex flex-col items-center justify-center text-gray-500">
+					<Zap class="w-12 h-12 mb-4 animate-pulse" />
+					<p>正在加载图谱数据...</p>
 				</div>
-				<h3 class="text-xl font-semibold text-gray-900 mb-2">知识图谱可视化</h3>
-				<p class="text-gray-600 mb-6 max-w-md">
-					这里将显示交互式的知识图谱。节点代表实体，边代表关系。
-				</p>
-				<div class="grid grid-cols-2 gap-4 text-sm text-gray-500">
-					<div>
-						<div class="font-medium text-gray-700">操作提示:</div>
-						<ul class="mt-1 space-y-1">
-							<li>• 拖拽移动节点</li>
-							<li>• 点击查看详情</li>
-							<li>• 滚轮缩放</li>
-						</ul>
-					</div>
-					<div>
-						<div class="font-medium text-gray-700">图例:</div>
-						<ul class="mt-1 space-y-1">
-							{#each nodeTypes.slice(0, 3) as type}
-								<li class="flex items-center">
-									<div class="w-2 h-2 rounded-full mr-2" style="background-color: {type.color}"></div>
-									{type.label}
-								</li>
-							{/each}
-						</ul>
-					</div>
+			{:else if !isLoading && graphElements.length === 0 && !selectedDocumentId}
+				<div class="absolute inset-0 flex flex-col items-center justify-center text-gray-500 p-8 text-center">
+					<Database class="w-12 h-12 mb-4 opacity-50" />
+					<h3 class="text-xl font-semibold text-gray-700 mb-2">知识图谱为空</h3>
+					<p class="max-w-md">
+						当前没有可显示的全局知识图谱数据。请先 <a href="/upload" class="text-blue-600 hover:underline">上传并处理文档</a>，
+						或从左侧选择一个已处理的文档来查看其对应的局部知识图谱。
+					</p>
 				</div>
-			</div>
+			{:else if !isLoading && graphElements.length === 0 && selectedDocumentId}
+				<div class="absolute inset-0 flex flex-col items-center justify-center text-gray-500 p-8 text-center">
+					<FileText class="w-12 h-12 mb-4 opacity-50" />
+					<h3 class="text-xl font-semibold text-gray-700 mb-2">文档图谱为空</h3>
+					<p class="max-w-md">
+						此文档尚未生成知识图谱数据，或者图谱数据为空。
+						请确保文档已成功处理。
+					</p>
+				</div>
+			{:else}
+				<KnowledgeGraph
+					bind:this={knowledgeGraphInstance}
+					elements={graphElements}
+					on:nodeclick={handleNodeClickFromGraph}
+					class="w-full h-full"
+				/>
+				<!-- Legend -->
+				<div class="absolute bottom-4 left-4 bg-white/80 backdrop-blur-sm p-3 rounded-lg border border-gray-200 shadow-md">
+					<h4 class="text-xs font-semibold text-gray-700 mb-2">图例</h4>
+					<ul class="space-y-1">
+						{#each nodeTypes.filter(nt => graphElements.some(el => el.data.type === nt.type && el.group === 'nodes')).slice(0, 5) as type}
+							<li class="flex items-center text-xs">
+								<div class="w-2.5 h-2.5 rounded-full mr-1.5" style="background-color: {type.color}"></div>
+								<span class="text-gray-600">{type.label}</span>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 		</div>
 	</div>
 </div> 
