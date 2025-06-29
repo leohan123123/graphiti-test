@@ -170,90 +170,117 @@ Schema:
             )
             
             # 解析响应
-            content = response.choices[0].message.content
-            logger.debug(f"DeepSeek 原始响应: {content}")
-            
-            try:
-                # 尝试解析 JSON
-                json_data = json.loads(content)
-                
-                # 验证必需字段并提供默认值
-                schema_properties = json_schema.get("properties", {})
-                required_fields = json_schema.get("required", [])
-                
-                for field in required_fields:
-                    if field not in json_data:
-                        # 根据字段类型提供默认值
-                        field_schema = schema_properties.get(field, {})
-                        field_type = field_schema.get("type", "string")
-                        
-                        if field_type == "array":
-                            json_data[field] = []
-                        elif field_type == "object":
-                            json_data[field] = {}
-                        elif field_type == "string":
-                            json_data[field] = ""
-                        elif field_type == "number":
-                            json_data[field] = 0
-                        elif field_type == "boolean":
-                            json_data[field] = False
+            api_content = None
+            if response.choices and response.choices[0] and response.choices[0].message and response.choices[0].message.content:
+                api_content = response.choices[0].message.content
+                logger.debug(f"DeepSeek 原始响应: {api_content}")
+            else:
+                logger.error("DeepSeek 响应无效、无消息或内容为空.")
+
+            parsed_json_data = None
+            if api_content:
+                try:
+                    # 尝试直接解析JSON
+                    parsed_json_data = json.loads(api_content)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"直接JSON解析失败: {e}. 尝试从内容中提取JSON.")
+                    import re
+                    # 尝试从 ```json ... ``` 或 ``` ... ``` 中提取
+                    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", api_content, re.DOTALL)
+                    if match:
+                        extracted_json_str = match.group(1)
+                        logger.info(f"从Markdown代码块中提取的JSON字符串: {extracted_json_str}")
+                        try:
+                            parsed_json_data = json.loads(extracted_json_str)
+                            logger.info("从提取的JSON字符串解析成功.")
+                        except json.JSONDecodeError as e_inner_md:
+                            logger.error(f"从Markdown提取的JSON解析失败: {e_inner_md}")
+                            parsed_json_data = None # Ensure it's None
+
+                    if parsed_json_data is None: # If markdown extraction didn't work or wasn't applicable
+                        # 尝试宽松的 regex 匹配 (原始的 r'\{.*\}')
+                        json_match_loose = re.search(r'\{.*\}', api_content, re.DOTALL)
+                        if json_match_loose:
+                            logger.info(f"尝试使用宽松的 regex 进行JSON提取.")
+                            try:
+                                parsed_json_data = json.loads(json_match_loose.group(0))
+                                logger.info("宽松的JSON提取和解析成功.")
+                            except json.JSONDecodeError as e_inner_loose:
+                                logger.error(f"宽松提取的JSON解析失败: {e_inner_loose}")
+                                parsed_json_data = None # Ensure it's None
+                            except Exception as e_gen_loose_inner:
+                                logger.error(f"宽松提取的JSON解析时发生未知错误: {e_gen_loose_inner}")
+                                parsed_json_data = None # Ensure it's None
                         else:
-                            json_data[field] = None
-                
-                # 创建 Pydantic 模型实例
-                result = response_model(**json_data)
-                logger.debug(f"解析成功: {result}")
-                return result
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON 解析失败: {e}, 内容: {content}")
-                # 如果 JSON 解析失败，尝试提取 JSON 部分
-                import re
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    try:
-                        json_data = json.loads(json_match.group())
-                        
-                        # 同样验证必需字段
-                        schema_properties = json_schema.get("properties", {})
-                        required_fields = json_schema.get("required", [])
-                        
-                        for field in required_fields:
-                            if field not in json_data:
-                                field_schema = schema_properties.get(field, {})
-                                field_type = field_schema.get("type", "string")
-                                
-                                if field_type == "array":
-                                    json_data[field] = []
-                                elif field_type == "object":
-                                    json_data[field] = {}
-                                else:
-                                    json_data[field] = ""
-                        
-                        result = response_model(**json_data)
-                        logger.debug(f"提取 JSON 成功: {result}")
-                        return result
-                    except Exception as parse_error:
-                        logger.error(f"提取的JSON解析也失败: {parse_error}")
-                
-                # 如果仍然失败，创建带有默认值的实例
-                logger.warning(f"使用默认值创建 {response_model.__name__}")
-                default_data = {}
-                schema_properties = json_schema.get("properties", {})
-                required_fields = json_schema.get("required", [])
-                
-                for field in required_fields:
-                    field_schema = schema_properties.get(field, {})
-                    field_type = field_schema.get("type", "string")
+                            logger.warning("在响应中未找到宽松匹配的JSON格式子字符串.")
+                except Exception as e_outer:
+                    # Catch any other unexpected error during parsing attempts
+                    logger.error(f"解析API内容时发生意外错误: {e_outer}")
+                    parsed_json_data = None
+
+            # 获取 schema 定义以备后用
+            schema_properties = json_schema.get("properties", {})
+            required_fields = json_schema.get("required", [])
+
+            if parsed_json_data is not None:
+                try:
+                    # 验证必需字段并提供默认值
+                    for field in required_fields:
+                        if field not in parsed_json_data:
+                            field_schema = schema_properties.get(field, {})
+                            field_type = field_schema.get("type", "string")
+                            # Provide default values based on type
+                            if field_type == "array":
+                                parsed_json_data[field] = []
+                            elif field_type == "object":
+                                parsed_json_data[field] = {}
+                            elif field_type == "string":
+                                parsed_json_data[field] = ""
+                            elif field_type == "number":
+                                parsed_json_data[field] = 0 # Or 0.0 if appropriate
+                            elif field_type == "integer":
+                                parsed_json_data[field] = 0
+                            elif field_type == "boolean":
+                                parsed_json_data[field] = False
+                            else:
+                                # For other types, or if type is not specified, use None
+                                parsed_json_data[field] = None
                     
-                    if field_type == "array":
-                        default_data[field] = []
-                    elif field_type == "object":
-                        default_data[field] = {}
-                    else:
-                        default_data[field] = ""
-                
-                return response_model(**default_data)
+                    result = response_model(**parsed_json_data)
+                    logger.debug(f"Pydantic 模型成功创建: {result}")
+                    return result
+                except Exception as e_pydantic:
+                    logger.error(f"使用API响应创建Pydantic模型失败: {e_pydantic}. 将使用默认值.")
+                    # Fall-through to default instantiation outside this block
+
+            # 如果 parsed_json_data 为 None 或 Pydantic 模型创建失败，则使用默认值
+            logger.warning(
+                f"无法从API响应中解析JSON或创建模型失败. "
+                f"将为 {response_model.__name__} 使用默认值."
+            )
+            default_data = {}
+            for field in required_fields:
+                field_schema = schema_properties.get(field, {})
+                field_type = field_schema.get("type", "string")
+                if field_type == "array":
+                    default_data[field] = []
+                elif field_type == "object":
+                    default_data[field] = {}
+                elif field_type == "string":
+                    default_data[field] = ""
+                elif field_type == "number":
+                    default_data[field] = 0 # Or 0.0
+                elif field_type == "integer":
+                    default_data[field] = 0
+                elif field_type == "boolean":
+                    default_data[field] = False
+                else:
+                    default_data[field] = None
+
+            # For any fields not in 'required' but in 'properties',
+            # Pydantic will use their default values if defined in the model, or raise error if required and no default.
+            # Our loop above only ensures 'required' fields get a basic default if missing from JSON.
+            return response_model(**default_data)
                 
         except Exception as e:
             logger.error(f"DeepSeek 结构化完成失败: {e}")
