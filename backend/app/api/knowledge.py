@@ -66,34 +66,35 @@ async def search_knowledge_graph(request: SearchRequest):
         raise HTTPException(status_code=500, detail="服务器内部错误，知识图谱搜索失败。")
 
 # Define a response model for health status for consistency
-class KnowledgeHealthResponse(BaseModel):
-    status: str
-    client_available: bool
-    neo4j_connected: bool
+class KnowledgeServiceHealthResponse(BaseModel):
+    overall_status: str
+    graphiti_client_available: bool
+    neo4j_connection_status: str # e.g., "connected", "disconnected"
+    neo4j_error: Optional[str] = None
     message: str
 
-@router.get("/health", response_model=KnowledgeHealthResponse)
-async def get_knowledge_health():
-    """获取知识图谱健康状态"""
+@router.get("/health", response_model=KnowledgeServiceHealthResponse)
+async def get_knowledge_service_health():
+    """获取知识图谱服务及其依赖（如Neo4j）的详细健康状态"""
     try:
         service = get_graphiti_service()
         
-        if not service: # service itself could be None if initial global setup failed
+        if not service:
             logger.error("Knowledge health check failed: Graphiti service object is None.")
-            # Return a valid KnowledgeHealthResponse indicating unavailability
-            return KnowledgeHealthResponse(
-                status="unhealthy",
-                client_available=False,
-                neo4j_connected=False,
+            return KnowledgeServiceHealthResponse(
+                overall_status="unhealthy",
+                graphiti_client_available=False,
+                neo4j_connection_status="unknown",
+                neo4j_error="Graphiti service object is None.",
                 message="Graphiti 服务未初始化或初始化失败。"
             )
         
-        # get_health_status should ideally return a dict that matches KnowledgeHealthResponse
-        health_status_dict = service.get_health_status()
-        return KnowledgeHealthResponse(**health_status_dict)
+        # get_health_status is now async and returns a more detailed dict
+        health_status_dict = await service.get_health_status()
+        return KnowledgeServiceHealthResponse(**health_status_dict)
         
     except Exception as e:
-        logger.error("Unexpected error fetching knowledge graph health status", exc_info=True)
+        logger.error("Unexpected error fetching knowledge service health status", exc_info=True)
         # In case of truly unexpected error, return 500 or a default unhealthy status
         # Raising HTTPException might be better to signal a server fault rather than a service health issue
         raise HTTPException(status_code=500, detail="服务器内部错误，无法获取知识图谱健康状态。")

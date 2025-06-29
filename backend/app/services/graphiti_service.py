@@ -297,31 +297,30 @@ class GraphitiService:
             }
         
         try:
-            # 从Neo4j数据库中获取真实的统计信息
-            from neo4j import GraphDatabase
-            
-            # 使用相同的连接配置
-            driver = GraphDatabase.driver(
-                "bolt://localhost:7687",
-                auth=("neo4j", "bridge123")
-            )
-            
-            with driver.session() as session:
+            if not self.client or not hasattr(self.client, 'graph_db') or not self.client.graph_db:
+                logger.error("❌ Neo4j driver (self.client.graph_db) is not available for get_graph_stats.")
+                return {
+                    "node_count": 0, "edge_count": 0, "episode_count": 0,
+                    "status": "错误: Neo4j driver not initialized in Graphiti client"
+                }
+
+            async with self.client.graph_db.session() as session:
                 # 获取节点数量
-                node_result = session.run("MATCH (n) RETURN count(n) as node_count")
-                node_count = node_result.single()["node_count"]
+                node_result = await session.run("MATCH (n) RETURN count(n) as node_count")
+                node_record = await node_result.single()
+                node_count = node_record["node_count"] if node_record else 0
                 
                 # 获取关系数量
-                edge_result = session.run("MATCH ()-[r]->() RETURN count(r) as edge_count")
-                edge_count = edge_result.single()["edge_count"]
+                edge_result = await session.run("MATCH ()-[r]->() RETURN count(r) as edge_count")
+                edge_record = await edge_result.single()
+                edge_count = edge_record["edge_count"] if edge_record else 0
                 
-                # 获取Episode节点数量
-                episode_result = session.run("MATCH (n:Episodic) RETURN count(n) as episode_count")
-                episode_count = episode_result.single()["episode_count"]
+                # 获取Episode节点数量 (ensure label is correct, Graphiti uses Episodic)
+                episode_result = await session.run("MATCH (n:Episodic) RETURN count(n) as episode_count")
+                episode_record = await episode_result.single()
+                episode_count = episode_record["episode_count"] if episode_record else 0
             
-            driver.close()
-            
-            logger.info(f"📊 获取到真实统计数据: 节点={node_count}, 关系={edge_count}, Episodes={episode_count}")
+            logger.info(f"📊 Graph stats via self.client.graph_db: Nodes={node_count}, Edges={edge_count}, Episodes={episode_count}")
             
             return {
                 "node_count": node_count,
@@ -338,13 +337,42 @@ class GraphitiService:
                 "episode_count": 0,
                 "status": f"错误: {e}"
             }
-    def get_health_status(self) -> Dict[str, Any]:
-        """获取健康状态"""
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        """获取Graphiti服务和Neo4j连接的详细健康状态"""
+        client_available = self.is_available()
+        neo4j_actually_connected = False
+        neo4j_error_message = None
+
+        if client_available and self.client and self.client.graph_db:
+            try:
+                async with self.client.graph_db.session() as session:
+                    result = await session.run("RETURN 1")
+                    await result.single() # Consume the result
+                neo4j_actually_connected = True
+                logger.debug("Neo4j connection health check successful.")
+            except Exception as e:
+                neo4j_error_message = str(e)
+                logger.error(f"Neo4j connection health check failed: {neo4j_error_message}", exc_info=True)
+        elif not client_available:
+            neo4j_error_message = "Graphiti client not available."
+        else: # client available but graph_db somehow not
+            neo4j_error_message = "Graphiti client available, but Neo4j driver (graph_db) is not."
+
+
+        overall_status = "healthy" if client_available and neo4j_actually_connected else "unhealthy"
+
+        message = f"Graphiti Service: {'Available' if client_available else 'Unavailable'}. "
+        message += f"Neo4j Connection: {'Connected' if neo4j_actually_connected else 'Disconnected'}"
+        if neo4j_error_message and not neo4j_actually_connected:
+            message += f" (Error: {neo4j_error_message})"
+
         return {
-            "status": "healthy" if self.is_available() else "unhealthy",
-            "client_available": self.is_available(),
-            "neo4j_connected": self.is_available(),  # 简化检查
-            "message": "Graphiti 服务正常" if self.is_available() else "Graphiti 服务不可用"
+            "overall_status": overall_status,
+            "graphiti_client_available": client_available,
+            "neo4j_connection_status": "connected" if neo4j_actually_connected else "disconnected",
+            "neo4j_error": neo4j_error_message if not neo4j_actually_connected else None,
+            "message": message
         }
 
     async def _extract_entities_and_relationships_with_llm(self, text: str) -> Dict[str, Any]:
@@ -883,60 +911,90 @@ async def build_knowledge_graph_from_pdf(
         logger.info(f"📊 文本长度: {len(pdf_content.text)} 字符")
         
         # 分段处理长文本，避免超过API限制
-        text_chunks = _split_text(pdf_content.text, max_chunk_size=3000)
-        total_entities = 0
-        total_relationships = 0
+        text_chunks = _split_text(pdf_content.text, max_chunk_size=3000) # Assuming max_chunk_size is in characters
         
+        # Accumulators for entities and relationships created/processed for THIS document
+        doc_specific_actual_entities_created = 0
+        doc_specific_actual_relationships_created = 0
+        doc_specific_llm_extracted_entities = 0
+        doc_specific_llm_extracted_relationships = 0
+        all_chunks_successful = True
+
         for i, chunk in enumerate(text_chunks):
-            logger.info(f"📝 处理文本块 {i+1}/{len(text_chunks)}")
+            logger.info(f"📝 Processing text chunk {i+1}/{len(text_chunks)} for document '{document_name}'")
             
-            # 添加重试机制
             max_retries = 3
-            retry_delay = 5  # 秒
-            
+            retry_delay = 5  # seconds
+            episode_result = None # Define episode_result before the loop
+
             for attempt in range(max_retries):
                 try:
-                    # 构建知识图谱
+                    cleaned_chunk = _clean_text_for_kg(chunk)
+                    if not cleaned_chunk.strip():
+                        logger.info(f"⏭️ Text chunk {i+1}/{len(text_chunks)} is empty after cleaning, skipping.")
+                        episode_result = {"success": True, "actual_created_entities": 0, "actual_created_relationships": 0, "llm_extracted_entities": 0, "llm_extracted_relationships": 0}
+                        break
+
+                    logger.debug(f"Cleaned chunk {i+1} to be processed (first 100 chars): {cleaned_chunk[:100]}...")
+
                     episode_result = await graphiti_service.build_knowledge_graph(
-                        chunk,
-                        f"{document_name}_chunk_{i+1}"
+                        cleaned_chunk,
+                        f"{document_name}_chunk_{i+1}" # document_id for this chunk
                     )
                     
-                    logger.info(f"✅ 文本块 {i+1} 处理成功")
-                    break
+                    if episode_result.get("success"):
+                        logger.info(f"✅ Text chunk {i+1}/{len(text_chunks)} processed successfully.")
+                    else:
+                        logger.error(f"❌ Text chunk {i+1}/{len(text_chunks)} processing reported failure: {episode_result.get('error', 'Unknown error')}")
+                        all_chunks_successful = False # Mark that at least one chunk failed
+
+                    break # Break from retry loop (either success or non-retryable failure from build_knowledge_graph)
                     
                 except Exception as e:
                     error_msg = str(e)
-                    if "Rate limit exceeded" in error_msg:
+                    logger.error(f"❌ Exception during processing chunk {i+1}/{len(text_chunks)}, attempt {attempt+1}/{max_retries}: {error_msg}", exc_info=True)
+                    all_chunks_successful = False
+                    episode_result = {"success": False, "error": error_msg, "actual_created_entities": 0, "actual_created_relationships": 0, "llm_extracted_entities": 0, "llm_extracted_relationships": 0}
+
+                    if "Rate limit exceeded" in error_msg: # Or other identifiable retryable errors
                         if attempt < max_retries - 1:
-                            logger.warning(f"⏳ 遇到速率限制，等待 {retry_delay} 秒后重试 (尝试 {attempt+1}/{max_retries})")
+                            logger.warning(f"⏳ Rate limit or retryable error. Waiting {retry_delay}s before retry {attempt+2}/{max_retries}.")
                             await asyncio.sleep(retry_delay)
-                            retry_delay *= 2  # 指数退避
-                            continue
+                            retry_delay *= 2  # Exponential backoff
                         else:
-                            logger.error(f"❌ 达到最大重试次数，跳过文本块 {i+1}")
+                            logger.error(f"❌ Max retries reached for chunk {i+1}/{len(text_chunks)}. Skipping this chunk.")
+                            break # Break from retry loop, chunk processing failed
                     else:
-                        logger.error(f"❌ 文本块 {i+1} 处理失败: {error_msg}")
-                        break
-        
-        # 获取统计信息
-        try:
-            stats = await graphiti_service.get_graph_stats()
-            total_entities = stats.get("node_count", 0)
-            total_relationships = stats.get("edge_count", 0)
-        except Exception as e:
-            logger.warning(f"获取统计信息失败: {e}")
-        
+                        logger.error(f"❌ Non-retryable error for chunk {i+1}/{len(text_chunks)}. Skipping retries for this chunk.")
+                        break # Break from retry loop, chunk processing failed
+
+            # Aggregate results from this chunk if episode_result is not None
+            if episode_result:
+                doc_specific_actual_entities_created += episode_result.get("actual_created_entities", 0)
+                doc_specific_actual_relationships_created += episode_result.get("actual_created_relationships", 0)
+                doc_specific_llm_extracted_entities += episode_result.get("llm_extracted_entities", 0)
+                doc_specific_llm_extracted_relationships += episode_result.get("llm_extracted_relationships", 0)
+
         processing_time = (datetime.now() - start_time).total_seconds()
         
-        logger.info(f"🎉 知识图谱构建完成")
-        logger.info(f"📊 实体数量: {total_entities}, 关系数量: {total_relationships}")
-        logger.info(f"⏱️ 处理时间: {processing_time:.2f} 秒")
+        final_success_status = all_chunks_successful # Document processing is successful if all chunks are (or skipped cleanly)
+
+        logger.info(f"🎉 Knowledge graph construction process for document '{document_name}' completed.")
+        logger.info(f"📄 Document Summary: LLM Extracted Entities: {doc_specific_llm_extracted_entities}, LLM Extracted Relationships: {doc_specific_llm_extracted_relationships}")
+        logger.info(f"💾 Document Summary: Actual New Graph Entities: {doc_specific_actual_entities_created}, Actual New Graph Relationships: {doc_specific_actual_relationships_created}")
+        logger.info(f"⏱️ Total processing time for document: {processing_time:.2f} seconds.")
         
+        # Log overall graph stats for context
+        try:
+            overall_stats = await graphiti_service.get_graph_stats()
+            logger.info(f"ℹ️ Current overall graph stats: Nodes={overall_stats.get('node_count', 'N/A')}, Edges={overall_stats.get('edge_count', 'N/A')}")
+        except Exception as e_stats:
+            logger.warning(f"Could not retrieve overall graph stats at the end of document processing: {e_stats}")
+
         return KnowledgeGraphResult(
-            success=True,
-            entity_count=total_entities,
-            relationship_count=total_relationships,
+            success=final_success_status, # Reflects if all chunks were processed without hard errors
+            entity_count=doc_specific_actual_entities_created, # Nodes created/merged for THIS document
+            relationship_count=doc_specific_actual_relationships_created, # Edges created/merged for THIS document
             processing_time=processing_time,
             group_id=target_group_id,
             error_message=None
@@ -1291,6 +1349,52 @@ def get_graphiti_service() -> GraphitiService:
             graphiti_service.client = None
     
     return graphiti_service
+
+async def create_neo4j_indexes_and_constraints(service: GraphitiService):
+    """Creates necessary indexes and constraints in Neo4j if they don't exist."""
+    if not service.is_available() or not service.client or not service.client.graph_db:
+        logger.error("Cannot create Neo4j indexes/constraints: Graphiti service or DB driver not available.")
+        return
+
+    async with service.client.graph_db.session() as session:
+        queries = [
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.uuid IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (ep:Episodic) REQUIRE ep.uuid IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (ep:Episodic) ON (ep.name)",
+        ]
+
+        # Specific entity types from the LLM prompt
+        entity_types = [
+            "Material", "BridgeComponent", "ConstructionMethod", "DesignStandard",
+            "Location", "Organization", "DamageType", "InspectionTechnique", "Permit",
+            "Bridge", "BridgeSection", "Sensor", "MonitoringSystem", "Regulation", "Software",
+            "EnvironmentalFactor", "LoadType", "GeotechnicalFeature"
+        ]
+
+        for entity_type in entity_types:
+            safe_label = sanitize_label(entity_type) # Ensure label is safe
+            if not safe_label.startswith("_"): # Avoid creating indexes on placeholder/error labels
+                # Index for merging: e.g. MERGE (e:Entity:Material {name: $name, entity_type: "Material"})
+                # An index on :Material(name) and :Material(entity_type) would be beneficial.
+                # Since entity_type property will be the same for all nodes with :Material label,
+                # an index on :Material(name) is the most important one for the MERGE.
+                queries.append(f"CREATE INDEX IF NOT EXISTS FOR (n:{safe_label}) ON (n.name)")
+                queries.append(f"CREATE INDEX IF NOT EXISTS FOR (n:{safe_label}) ON (n.entity_type)")
+
+
+        logger.info("🚀 Attempting to create Neo4j indexes and constraints...")
+        for query in queries:
+            try:
+                logger.debug(f"Executing Neo4j schema query: {query}")
+                await session.run(query)
+            except Exception as e:
+                # Errors can happen if an index/constraint exists in a slightly different form
+                # or due to concurrent modifications. Usually, "IF NOT EXISTS" handles most cases.
+                logger.warning(f"⚠️ Could not execute Neo4j schema query '{query}': {e}")
+        logger.info("✅ Neo4j indexes and constraints creation process completed.")
+
 
 def reset_graphiti_service():
     """重置 Graphiti 服务（用于测试）"""

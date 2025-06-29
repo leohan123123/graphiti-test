@@ -35,9 +35,19 @@ class DeepSeekClient(OpenAIClient):
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
         
         # DeepSeek 的限制
-        self.MAX_CONTEXT_LENGTH = 65536  # DeepSeek 最大上下文长度
-        self.RESERVED_TOKENS = 2000      # 为响应预留的 token 数量
-        self.MAX_INPUT_TOKENS = self.MAX_CONTEXT_LENGTH - self.RESERVED_TOKENS
+        # 根据 DeepSeek 官方文档 (通常 deepseek-chat 为 32k context, 8k output completion)
+        self.MAX_CONTEXT_LENGTH = 32768  # DeepSeek deepseek-chat 模型最大上下文长度
+        self.MAX_OUTPUT_TOKENS = 8192    # DeepSeek deepseek-chat 模型最大输出 token 数量
+        self.RESERVED_TOKENS = self.MAX_OUTPUT_TOKENS # 为响应预留的 token 数量，确保有足够空间生成完整响应
+        self.MAX_INPUT_TOKENS = self.MAX_CONTEXT_LENGTH - self.RESERVED_TOKENS # 最大输入 token 数量
+
+        logger.info(
+            f"DeepSeek Tokenizer: {self.tokenizer.name}. "
+            f"Context Length: {self.MAX_CONTEXT_LENGTH}, "
+            f"Max Output Tokens: {self.MAX_OUTPUT_TOKENS}, "
+            f"Reserved for Output: {self.RESERVED_TOKENS}, "
+            f"Max Input Tokens: {self.MAX_INPUT_TOKENS}"
+        )
         
         # Log the API key being used (mask it for production logs if sensitive)
         api_key_to_log = config.api_key[:5] + "..." + config.api_key[-4:] if config.api_key and len(config.api_key) > 9 else "Not Set or Too Short"
@@ -156,11 +166,16 @@ Schema:
                 logger.info(f"截断后 token 数量: {final_tokens}")
             
             # 限制max_tokens在DeepSeek允许的范围内
-            max_tokens = kwargs.get("max_tokens", 2000)
-            if max_tokens and max_tokens > 8192:
-                max_tokens = 8192
-            elif max_tokens and max_tokens < 1:
-                max_tokens = 1000
+            # Default max_tokens for completion, can be overridden by kwargs
+            default_completion_max_tokens = 2000
+            max_tokens = kwargs.get("max_tokens", default_completion_max_tokens)
+
+            if max_tokens and max_tokens > self.MAX_OUTPUT_TOKENS:
+                logger.warning(f"Requested max_tokens ({max_tokens}) exceeds model's MAX_OUTPUT_TOKENS ({self.MAX_OUTPUT_TOKENS}). Clamping to {self.MAX_OUTPUT_TOKENS}.")
+                max_tokens = self.MAX_OUTPUT_TOKENS
+            elif max_tokens and max_tokens < 1: # Ensure at least some tokens are requested for output
+                logger.warning(f"Requested max_tokens ({max_tokens}) is invalid. Setting to a minimum of 100.")
+                max_tokens = 100 # A small reasonable minimum
             
             # 使用标准的 chat completions API
             response = await self.client.chat.completions.create(
@@ -331,15 +346,37 @@ Schema:
             # 标准文本生成 - 也需要检查 token 限制
             total_tokens = self._count_messages_tokens(messages)
             if total_tokens > self.MAX_INPUT_TOKENS:
-                logger.warning(f"标准生成 Token 数量超限，开始截断...")
+                logger.warning(f"标准生成 Token 数量 ({total_tokens}) 超限 ({self.MAX_INPUT_TOKENS})，开始截断...")
                 messages = self._truncate_messages(messages, self.MAX_INPUT_TOKENS)
+                logger.info(f"标准生成截断后 token 数量: {self._count_messages_tokens(messages)}")
             
-            max_tokens = max_tokens or 1000
-            if max_tokens > 8192:
-                max_tokens = 8192
+            # Use the provided max_tokens or a default, ensuring it's within model limits
+            default_text_gen_max_tokens = 1000 # Default for standard text generation
+            current_max_tokens = max_tokens if max_tokens is not None else default_text_gen_max_tokens
+
+            if current_max_tokens > self.MAX_OUTPUT_TOKENS:
+                logger.warning(f"Requested max_tokens ({current_max_tokens}) for standard generation exceeds model's MAX_OUTPUT_TOKENS ({self.MAX_OUTPUT_TOKENS}). Clamping to {self.MAX_OUTPUT_TOKENS}.")
+                current_max_tokens = self.MAX_OUTPUT_TOKENS
+            elif current_max_tokens < 1:
+                logger.warning(f"Requested max_tokens ({current_max_tokens}) for standard generation is invalid. Setting to a minimum of 100.")
+                current_max_tokens = 100 # A small reasonable minimum
             
-            response = await self.client.chat.completions.create(
-                model=self.config.model,
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=0.7, # Default temperature for text generation
+                    max_tokens=current_max_tokens
+                )
+                # Check if response and choices are valid before accessing content
+                if response and response.choices and response.choices[0].message:
+                    return {"content": response.choices[0].message.content}
+                else:
+                    logger.error("DeepSeek standard generation returned invalid response structure.")
+                    return {"content": None, "error": "DeepSeek returned invalid response structure."}
+            except Exception as e:
+                logger.error(f"Error during DeepSeek standard generation: {e}", exc_info=True)
+                return {"content": None, "error": str(e)}
                 messages=messages,
                 temperature=0.7,
                 max_tokens=max_tokens
