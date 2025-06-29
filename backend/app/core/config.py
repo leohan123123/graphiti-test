@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # 服务器配置
     HOST: str = Field(default="0.0.0.0", env="HOST")
     PORT: int = Field(default=8000, env="PORT")
+    RETRY_PORTS: list[int] = Field(default_factory=lambda: [8001, 8002, 8003], env="RETRY_PORTS")
     
     # 安全配置
     SECRET_KEY: str = Field(env="SECRET_KEY")
