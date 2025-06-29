@@ -39,7 +39,9 @@ class DeepSeekClient(OpenAIClient):
         self.RESERVED_TOKENS = 2000      # 为响应预留的 token 数量
         self.MAX_INPUT_TOKENS = self.MAX_CONTEXT_LENGTH - self.RESERVED_TOKENS
         
-        logger.info(f"✅ DeepSeek 客户端初始化成功: {config.model}")
+        # Log the API key being used (mask it for production logs if sensitive)
+        api_key_to_log = config.api_key[:5] + "..." + config.api_key[-4:] if config.api_key and len(config.api_key) > 9 else "Not Set or Too Short"
+        logger.info(f"✅ DeepSeek 客户端初始化: model={config.model}, base_url={config.base_url}, api_key_used={api_key_to_log}")
     
     def _count_tokens(self, text: str) -> int:
         """计算文本的 token 数量"""
@@ -171,11 +173,15 @@ Schema:
             
             # 解析响应
             api_content = None
-            if response.choices and response.choices[0] and response.choices[0].message and response.choices[0].message.content:
-                api_content = response.choices[0].message.content
-                logger.debug(f"DeepSeek 原始响应: {api_content}")
+            # Ensuring access via .content as per user's explicit instruction, though it was already the case.
+            if response.choices and response.choices[0] and response.choices[0].message:
+                api_content = response.choices[0].message.content # Explicitly using .content
+                if api_content:
+                    logger.debug(f"DeepSeek 原始响应: {api_content[:500]}...") # Log snippet
+                else:
+                    logger.warning("DeepSeek 响应消息内容为空.")
             else:
-                logger.error("DeepSeek 响应无效、无消息或内容为空.")
+                logger.error("DeepSeek 响应无效、无有效选项或消息对象为空.")
 
             parsed_json_data = None
             if api_content:

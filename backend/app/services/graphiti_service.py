@@ -48,14 +48,16 @@ class GraphitiService:
             # 方式1：使用DeepSeek API（优先）
             try:
                 from graphiti_core.llm_client.config import LLMConfig
-                from app.services.deepseek_client import DeepSeekClient
-                from app.services.deepseek_embedder import DeepSeekEmbedder
+                # Corrected import path
+                from ..services.deepseek_client import DeepSeekClient
+                from ..services.deepseek_embedder import DeepSeekEmbedder
                 
                 # 配置 DeepSeek LLM（使用自定义客户端）
+                settings = get_settings()
                 llm_config = LLMConfig(
-                    api_key="sk-0b26cde0319b451e984c38a0734353e7",
-                    model="deepseek-chat",
-                    base_url="https://api.deepseek.com/v1"
+                    api_key=settings.OPENAI_API_KEY if settings.OPENAI_API_KEY else "sk-0b26cde0319b451e984c38a0734353e7", # Use env var if available
+                    model="deepseek-chat", # This could also be from settings
+                    base_url="https://api.deepseek.com/v1" # This could also be from settings
                 )
                 llm_client = DeepSeekClient(config=llm_config)
                 
@@ -64,47 +66,55 @@ class GraphitiService:
                 
                 # 配置Graphiti，使用DeepSeek LLM和自定义嵌入器
                 self.client = Graphiti(
-                    uri="bolt://localhost:7687",
-                    user="neo4j", 
-                    password="bridge123",
+                    uri=settings.NEO4J_URI,
+                    user=settings.NEO4J_USER,
+                    password=settings.NEO4J_PASSWORD,
                     llm_client=llm_client,
                     embedder=embedder
                     # cross_encoder=None (默认，避免额外API调用)
                 )
                 logger.info("✅ Graphiti 客户端初始化成功（使用DeepSeek API）")
                 return
+            except ImportError as ie:
+                logger.error(f"⚠️ DeepSeek组件导入失败: {ie}")
             except Exception as e1:
                 logger.warning(f"⚠️ DeepSeek初始化失败: {e1}")
             
             # 方式2：使用环境变量中的OpenAI配置（备用）
-            if os.environ.get("OPENAI_API_KEY"):
+            settings = get_settings() # Ensure settings are loaded
+            if settings.OPENAI_API_KEY: # Check settings instead of raw os.environ
                 try:
                     self.client = Graphiti(
-                        uri="bolt://localhost:7687",
-                        user="neo4j", 
-                        password="bridge123"
+                        uri=settings.NEO4J_URI,
+                        user=settings.NEO4J_USER,
+                        password=settings.NEO4J_PASSWORD
+                        # This will use OpenAI by default if OPENAI_API_KEY is set in env
                     )
                     logger.info("✅ Graphiti 客户端初始化成功（使用OpenAI配置）")
                     return
                 except Exception as e2:
                     logger.warning(f"⚠️ OpenAI初始化失败: {e2}")
             
-            # 方式3：最简单的初始化（最后备用）
+            # 方式3：最简单的初始化（最后备用, no LLM or custom embedder）
             try:
+                settings = get_settings() # Ensure settings are loaded
                 self.client = Graphiti(
-                    uri="bolt://localhost:7687",
-                    user="neo4j", 
-                    password="bridge123"
+                    uri=settings.NEO4J_URI,
+                    user=settings.NEO4J_USER,
+                    password=settings.NEO4J_PASSWORD,
+                    llm_client=None, # Explicitly no LLM if other setups failed
+                    embedder=None    # Explicitly no embedder
                 )
-                logger.info("✅ Graphiti 客户端初始化成功（使用默认配置）")
+                logger.info("✅ Graphiti 客户端初始化成功（使用默认配置, 无 LLM/Embedder）")
                 return
             except Exception as e3:
                 logger.warning(f"⚠️ 默认初始化失败: {e3}")
             
-            raise Exception("所有初始化方式都失败了")
+            logger.error("❌ 所有Graphiti初始化方式都失败了。Graphiti服务将不可用。")
+            self.client = None # Ensure client is None if all attempts fail
             
-        except Exception as e:
-            logger.error(f"❌ Graphiti 客户端初始化失败: {e}")
+        except Exception as e: # Catch-all for any unexpected error during the process
+            logger.error(f"❌ Graphiti 客户端初始化过程中发生严重错误: {e}")
             self.client = None
 
 
@@ -114,7 +124,7 @@ class GraphitiService:
     
     async def build_knowledge_graph(self, text: str, document_id: str) -> Dict[str, Any]:
         """构建知识图谱"""
-        if not self.is_available():
+        if not self.is_available() or not self.client: # Added self.client check for clarity
             logger.error("❌ Graphiti 客户端不可用")
             return {
                 "success": False,
@@ -769,10 +779,16 @@ From the provided text, please extract entities and their relationships.
             # Ensure relationship type is valid for Cypher
             sanitized_rel_type = sanitize_label(rel_type, is_relationship_type=True)
 
+            # Filter out problematic/unwanted properties before storing
+            unwanted_rel_props = ["episodes", "expired_at", "invalid_at"]
+            sanitized_rel_llm_props = {k: v for k, v in properties.items() if k not in unwanted_rel_props}
+            if len(properties) != len(sanitized_rel_llm_props):
+                logger.debug(f"Filtered out {len(properties) - len(sanitized_rel_llm_props)} unwanted properties from LLM-extracted relationship properties for type {rel_type}.")
+
 
             try:
                 # Graphiti's add_edge might be:
-                # await self.client.add_edge(source_node_uuid, target_node_uuid, rel_type, properties=properties)
+                # await self.client.add_edge(source_node_uuid, target_node_uuid, rel_type, properties=sanitized_rel_llm_props)
                 # Or using Cypher for more control (e.g., MERGE to avoid duplicate relationships if properties should be unique)
                 cypher_query = f"""
                 MATCH (source:Entity {{uuid: $source_uuid}})
@@ -790,7 +806,7 @@ From the provided text, please extract entities and their relationships.
                     result = await session.run(cypher_query,
                                                source_uuid=source_graph_uuid,
                                                target_uuid=target_graph_uuid,
-                                               props=properties)
+                                               props=sanitized_rel_llm_props) # Use sanitized props
                     record = await result.single()
                     if record and record["created_or_matched"]: # Assuming MERGE always returns the rel if matched/created
                         created_count +=1 # This counts merged relationships as "created" for simplicity here.
