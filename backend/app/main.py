@@ -7,6 +7,9 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 import time
 import logging
+import socket
+import sys # For exiting if no port is available
+from contextlib import asynccontextmanager
 
 from .core.config import get_settings, create_upload_dir
 from .api import documents, knowledge, export
@@ -23,12 +26,27 @@ logger = logging.getLogger(__name__)
 # 获取配置
 settings = get_settings()
 
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info(f"启动 {settings.PROJECT_NAME} v{settings.VERSION}")
+    # 创建必要的目录
+    create_upload_dir()
+    logger.info("应用启动完成 - Lifespan Startup")
+    yield
+    # Shutdown
+    logger.info("应用正在关闭... - Lifespan Shutdown")
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description="基于 Graphiti 的桥梁工程知识图谱构建平台",
-    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan
 )
 
 # 配置 CORS
@@ -68,26 +86,6 @@ async def global_exception_handler(request: Request, exc: Exception):
             "detail": str(exc) if settings.DEBUG else "请联系管理员"
         }
     )
-
-
-# 启动事件
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时的初始化"""
-    logger.info(f"启动 {settings.PROJECT_NAME} v{settings.VERSION}")
-    
-    # 创建必要的目录
-    create_upload_dir()
-    
-    # 初始化服务 (会在第一次调用时自动初始化)
-    logger.info("应用启动完成")
-
-
-# 关闭事件
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时的清理"""
-    logger.info("应用正在关闭...")
 
 
 # 健康检查
@@ -180,11 +178,41 @@ async def get_app_info():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
+    def is_port_in_use(port: int, host: str) -> bool:
+        """检查指定端口是否被占用"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return False  # Port is available
+            except socket.error as e:
+                logger.warning(f"端口 {port} 在主机 {host} 上已被占用或发生错误: {e}")
+                return True # Port is in use or other error
+
+    port_to_use = settings.PORT
+    host_to_use = settings.HOST
+
+    if is_port_in_use(port_to_use, host_to_use):
+        logger.info(f"默认端口 {port_to_use} 在主机 {host_to_use} 上已被占用. 尝试备用端口...")
+        found_available_port = False
+        for retry_port in settings.RETRY_PORTS:
+            if not is_port_in_use(retry_port, host_to_use):
+                port_to_use = retry_port
+                found_available_port = True
+                logger.info(f"找到可用端口: {port_to_use} 在主机 {host_to_use} 上")
+                break
+
+        if not found_available_port:
+            logger.error(f"在主机 {host_to_use} 上所有指定端口 ({settings.PORT} 和 {settings.RETRY_PORTS}) 都已被占用. 应用无法启动.")
+            sys.exit(1) # Exit if no port is available
+    else:
+        logger.info(f"默认端口 {port_to_use} 在主机 {host_to_use} 上可用.")
+
+    logger.info(f"启动 Uvicorn 服务于 {host_to_use}:{port_to_use}")
     uvicorn.run(
         "app.main:app",
-        host=settings.HOST,
-        port=settings.PORT,
+        host=host_to_use,
+        port=port_to_use,
         reload=settings.DEBUG,
         log_level="info"
-    ) 
+    )
