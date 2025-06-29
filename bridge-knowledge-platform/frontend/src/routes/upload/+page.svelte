@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { Upload, FileText, File as FileIcon, CheckCircle, XCircle, AlertCircle, Trash2 } from 'lucide-svelte';
+	import { websocketMessages, type FileStatusMessage } from '$lib/stores/websocketStore';
+	import { onMount, onDestroy } from 'svelte';
 	
 	interface UploadFile {
-		id: string;
+		id: string; // This will be the server-assigned file_id after initial upload response
+		clientSideId: string; // Temporary ID for display before server ID is known
 		file: File;
 		status: 'pending' | 'uploading' | 'processing' | 'completed' | 'error';
 		progress: number;
 		error?: string;
+		stage?: string; // For processing stage display
 	}
 	
 	let files: UploadFile[] = $state([]);
@@ -58,14 +62,17 @@
 				continue;
 			}
 			
+			const clientSideId = Math.random().toString(36).substr(2, 9);
 			const uploadFile: UploadFile = {
-				id: Math.random().toString(36).substr(2, 9),
+				id: '', // Server ID will be populated after successful upload
+				clientSideId: clientSideId,
 				file,
 				status: 'pending',
 				progress: 0
 			};
 			
-			files.push(uploadFile);
+			// Use spread to ensure reactivity when pushing to array
+			files = [...files, uploadFile];
 		}
 	}
 	
@@ -95,75 +102,124 @@
 		dragOver = false;
 	}
 	
-	function removeFile(id: string) {
-		files = files.filter(f => f.id !== id);
+	function removeFile(clientSideIdToRemove: string) {
+		files = files.filter(f => f.clientSideId !== clientSideIdToRemove);
 	}
 	
-	async function uploadFile(uploadFile: UploadFile) {
-		uploadFile.status = 'uploading';
-		
-		try {
+	function uploadFile(uploadFileToProcess: UploadFile) {
+		return new Promise<void>((resolve, reject) => {
+			const targetFile = files.find(f => f.clientSideId === uploadFileToProcess.clientSideId);
+			if (!targetFile) {
+				reject(new Error("File not found in list for upload."));
+				return;
+			}
+
+			targetFile.status = 'uploading';
+			targetFile.progress = 0;
+			files = [...files]; // Trigger reactivity
+
 			const formData = new FormData();
-			formData.append('file', uploadFile.file);
-			
-			// 真实的API调用
-			const response = await fetch('/api/v1/documents/upload', {
-				method: 'POST',
-				body: formData
-			});
-			
-			if (!response.ok) {
-				throw new Error(`上传失败: ${response.status}`);
-			}
-			
-			const result = await response.json();
-			uploadFile.progress = 100;
-			
-			if (result.success) {
-				uploadFile.status = 'processing';
-				
-				// 自动开始处理文档 (使用URL参数)
-				const processResponse = await fetch(`/api/v1/documents/process/${result.file_id}?enable_ocr=true&build_graph=true`, {
-					method: 'POST'
-				});
-				
-				if (processResponse.ok) {
-					// 轮询处理状态
-					await pollProcessingStatus(result.file_id, uploadFile);
-				} else {
-					uploadFile.status = 'completed';
+			formData.append('file', targetFile.file);
+
+			const xhr = new XMLHttpRequest();
+			xhr.open('POST', '/api/v1/documents/upload', true);
+
+			xhr.upload.onprogress = (event) => {
+				if (event.lengthComputable) {
+					const percentComplete = Math.round((event.loaded / event.total) * 100);
+					targetFile.progress = percentComplete;
+					files = [...files];
 				}
-			} else {
-				throw new Error(result.message || '上传失败');
-			}
-		} catch (error) {
-			uploadFile.status = 'error';
-			uploadFile.error = error instanceof Error ? error.message : '上传失败，请重试';
-		}
+			};
+
+			xhr.onload = async () => {
+				if (xhr.status >= 200 && xhr.status < 300) {
+					const result = JSON.parse(xhr.responseText);
+					targetFile.progress = 100;
+
+					if (result.success && result.file_id) {
+						targetFile.id = result.file_id; // Store the server-assigned file_id
+						targetFile.status = 'processing';
+						targetFile.progress = 0; // Reset progress for server-side processing phase
+						targetFile.stage = '等待处理...';
+						files = [...files];
+
+						// Trigger backend processing
+						try {
+							const processResponse = await fetch(`/api/v1/documents/process/${result.file_id}?enable_ocr=true&build_graph=true`, {
+								method: 'POST'
+							});
+
+							if (!processResponse.ok) {
+								const errorText = await processResponse.text();
+								throw new Error(`处理启动失败: ${processResponse.status} ${errorText}`);
+							}
+							// Processing started, WebSocket will handle updates from here.
+							// No more polling needed.
+							resolve();
+						} catch (processError) {
+							targetFile.status = 'error';
+							targetFile.error = processError instanceof Error ? processError.message : '处理启动失败';
+							files = [...files];
+							reject(processError);
+						}
+					} else {
+						targetFile.status = 'error';
+						targetFile.error = result.message || '上传成功但服务器返回错误';
+						files = [...files];
+						reject(new Error(targetFile.error));
+					}
+				} else {
+					targetFile.status = 'error';
+					targetFile.error = `上传失败: ${xhr.status} ${xhr.statusText}`;
+					files = [...files];
+					reject(new Error(targetFile.error));
+				}
+			};
+
+			xhr.onerror = () => {
+				targetFile.status = 'error';
+				targetFile.error = '网络错误或上传被中断';
+				targetFile.progress = 0;
+				files = [...files];
+				reject(new Error(targetFile.error));
+			};
+
+			xhr.send(formData);
+		});
 	}
 	
-	async function pollProcessingStatus(fileId: string, uploadFile: UploadFile) {
-		try {
-			const response = await fetch(`/api/v1/documents/status/${fileId}`);
-			if (response.ok) {
-				const status = await response.json();
-				uploadFile.progress = status.progress || 0;
-				
-				if (status.status === 'completed') {
-					uploadFile.status = 'completed';
-				} else if (status.status === 'failed') {
-					uploadFile.status = 'error';
-					uploadFile.error = status.message || '处理失败';
-				} else {
-					// 继续轮询
-					setTimeout(() => pollProcessingStatus(fileId, uploadFile), 2000);
+	// No longer need pollProcessingStatus due to WebSocket integration
+
+	let unsubscribeFromWebsocket: (() => void) | null = null;
+
+	onMount(() => {
+		unsubscribeFromWebsocket = websocketMessages.subscribe(message => {
+			if (message && message.type === 'file_status_update') {
+				const data = message.payload as FileStatusMessage['payload'];
+				const fileToUpdate = files.find(f => f.id === data.file_id);
+
+				if (fileToUpdate) {
+					fileToUpdate.status = data.status;
+					fileToUpdate.progress = data.progress;
+					fileToUpdate.stage = data.stage || fileToUpdate.stage;
+					if (data.status === 'failed' && data.message) {
+						fileToUpdate.error = data.message;
+					}
+					if (data.status === 'completed') {
+						fileToUpdate.progress = 100;
+					}
+					files = [...files]; // Trigger Svelte reactivity
 				}
 			}
-		} catch (error) {
-			console.error('状态轮询失败:', error);
-			uploadFile.status = 'completed'; // 降级处理
+		});
+	});
+
+	onDestroy(() => {
+		if (unsubscribeFromWebsocket) {
+			unsubscribeFromWebsocket();
 		}
-	}
+	});
 	
 	async function uploadAll() {
 		const pendingFiles = files.filter(f => f.status === 'pending');
@@ -255,7 +311,7 @@
 			</div>
 			
 			<div class="divide-y divide-gray-200">
-				{#each files as file (file.id)}
+				{#each files as file (file.clientSideId)} {{!-- Use clientSideId for key as server `id` might not be available initially --}}
 					{@const FileIcon = getFileIcon(file.file)}
 					<div class="p-6 flex items-center space-x-4">
 						<!-- File Icon -->
@@ -273,41 +329,47 @@
 							</p>
 							
 							<!-- Progress Bar -->
-							{#if file.status === 'uploading'}
+							{#if file.status === 'uploading' || file.status === 'processing'}
 								<div class="mt-2 bg-gray-200 rounded-full h-2">
 									<div 
-										class="bg-blue-600 h-2 rounded-full transition-all duration-300"
+										class="h-2 rounded-full transition-all duration-300
+											{file.status === 'uploading' ? 'bg-blue-600' : 'bg-yellow-500'}"
 										style="width: {file.progress}%"
 									></div>
 								</div>
 								<p class="text-xs text-gray-500 mt-1">
-									上传中... {file.progress}%
+									{#if file.status === 'uploading'}
+										上传中... {file.progress}%
+									{:else if file.status === 'processing'}
+										{file.stage || '处理中'}... {file.progress}%
+									{/if}
 								</p>
 							{/if}
 						</div>
 						
 						<!-- Status -->
-						<div class="flex items-center space-x-2">
+						<div class="flex items-center space-x-2 min-w-[120px] justify-end"> {{!-- Added min-width and justify-end --}}
 							{#if file.status === 'pending'}
 								<span class="text-sm text-gray-500">等待上传</span>
 							{:else if file.status === 'uploading'}
-								<span class="text-sm text-blue-600">上传中...</span>
+								<span class="text-sm text-blue-600">上传中</span>
 							{:else if file.status === 'processing'}
 								<AlertCircle class="w-5 h-5 text-yellow-500" />
-								<span class="text-sm text-yellow-600">处理中...</span>
+								<span class="text-sm text-yellow-600">{file.stage || '处理中'}</span>
 							{:else if file.status === 'completed'}
 								<CheckCircle class="w-5 h-5 text-green-500" />
 								<span class="text-sm text-green-600">已完成</span>
 							{:else if file.status === 'error'}
 								<XCircle class="w-5 h-5 text-red-500" />
-								<span class="text-sm text-red-600">
-									{file.error || '上传失败'}
+								<span class="text-sm text-red-600 truncate" title={file.error}>
+									{file.error || '失败'}
 								</span>
 							{/if}
 							
 							<button
-								onclick={() => removeFile(file.id)}
+								onclick={() => removeFile(file.clientSideId)}
 								class="p-1 text-gray-400 hover:text-red-500 transition-colors duration-200"
+								title="移除文件"
 							>
 								<Trash2 class="w-4 h-4" />
 							</button>
