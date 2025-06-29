@@ -259,7 +259,7 @@ class GraphitiService:
                 edge_count = edge_result.single()["edge_count"]
                 
                 # 获取Episode节点数量
-                episode_result = session.run("MATCH (n:Episode) RETURN count(n) as episode_count")
+                episode_result = session.run("MATCH (n:Episodic) RETURN count(n) as episode_count")
                 episode_count = episode_result.single()["episode_count"]
             
             driver.close()
