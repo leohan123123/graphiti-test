@@ -120,4 +120,14 @@ celerybeat.pid
 # mypy
 .mypy_cache/
 .dmypy.json
-dmypy.json 
+dmypy.json
+
+# Docker .env files
+backend/.env.backend
+neo4j/.env.neo4j
+
+# Neo4j local data/logs (if not using named volumes exclusively)
+# These are typically handled by Docker named volumes in docker-compose.yml,
+# but good to have if someone runs neo4j locally or maps differently.
+neo4j/data/
+neo4j/logs/

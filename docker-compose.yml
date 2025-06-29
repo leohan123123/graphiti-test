@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app # Optional: for development to reflect code changes
+    env_file:
+      - ./backend/.env.backend
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"] # Assuming /health endpoint
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./bridge-knowledge-platform/frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80" # Or 5173:80 if you want to map to a common dev port locally
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost || exit 1"] # Nginx serves on port 80
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "7474:7474" # Neo4j Browser
+      - "7687:7687" # Bolt port
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      # If you have plugins, uncomment and adjust the path:
+      # - ./neo4j/plugins:/plugins
+    env_file:
+      - ./neo4j/.env.neo4j
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s # Neo4j can take a while to start
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  app-network:
+    driver: bridge
