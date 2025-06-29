@@ -10,6 +10,7 @@ import logging
 import socket
 import sys # For exiting if no port is available
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from .core.config import get_settings, create_upload_dir
 from .api import documents, knowledge, export
@@ -34,6 +35,21 @@ async def lifespan(app: FastAPI):
     logger.info(f"启动 {settings.PROJECT_NAME} v{settings.VERSION}")
     # 创建必要的目录
     create_upload_dir()
+
+    # 初始化 Graphiti 服务并创建 Neo4j 索引/约束
+    try:
+        from .services.graphiti_service import get_graphiti_service, create_neo4j_indexes_and_constraints
+        graphiti_service = get_graphiti_service() # Ensure it's initialized
+        if graphiti_service.is_available():
+            logger.info("Graphiti service initialized. Attempting to create Neo4j indexes and constraints...")
+            await create_neo4j_indexes_and_constraints(graphiti_service)
+        else:
+            logger.error("Graphiti service is not available. Skipping Neo4j index creation.")
+    except Exception as e:
+        logger.error(f"Error during startup (Graphiti service init or index creation): {e}", exc_info=True)
+        # Depending on severity, you might want to prevent app startup
+        # For now, just log the error.
+
     logger.info("应用启动完成 - Lifespan Startup")
     yield
     # Shutdown
