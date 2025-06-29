@@ -236,11 +236,12 @@ async def upload_file(file: UploadFile = File(...)):
             message="文件上传成功"
         )
         
-    except HTTPException:
+    except HTTPException as http_exc:
+        logger.warning(f"HTTPException during file upload for '{file.filename}': {http_exc.detail}")
         raise
     except Exception as e:
-        logger.error(f"文件上传失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+        logger.error(f"Unexpected error during file upload for '{file.filename}'", exc_info=True)
+        raise HTTPException(status_code=500, detail="服务器内部错误，文件上传失败。请稍后重试或联系管理员。")
 
 
 def find_file_by_id(file_id: str) -> tuple[str, str] | None:
@@ -259,14 +260,15 @@ def find_file_by_id(file_id: str) -> tuple[str, str] | None:
 @router.get("/status/{file_id}", response_model=ProcessingStatus)
 async def get_processing_status(file_id: str):
     """获取文件处理状态"""
-    # 从数据库获取真实的文档状态
-    documents = load_documents_db()
-    if file_id not in documents:
-        raise HTTPException(status_code=404, detail="文件ID不存在")
-    
-    doc_info = documents[file_id]
-    
-    # 根据文档状态计算进度和消息
+    try:
+        documents = load_documents_db()
+        if file_id not in documents:
+            logger.warning(f"Status requested for non-existent file_id: {file_id}")
+            raise HTTPException(status_code=404, detail="文件ID不存在")
+
+        doc_info = documents[file_id]
+
+        # 根据文档状态计算进度和消息
     progress_map = {
         "uploaded": 0,
         "processing": 50,
@@ -292,130 +294,35 @@ async def get_processing_status(file_id: str):
             "error_message": doc_info.error_message
         }
     )
+    except HTTPException as http_exc:
+        # This will be caught by the global exception handler if not handled here,
+        # but explicit logging can be useful.
+        logger.warning(f"HTTPException in get_processing_status for file_id '{file_id}': {http_exc.detail}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_processing_status for file_id '{file_id}'", exc_info=True)
+        raise HTTPException(status_code=500, detail="服务器内部错误，获取状态失败。")
 
 
 async def _parse_document_internal(file_id: str, enable_ocr: bool = True):
     """内部解析函数，返回原始数据而不是JSONResponse"""
-    # 检查文件ID，如果内存中没有则尝试恢复
-    if file_id not in processing_status:
-        file_info = find_file_by_id(file_id)
-        if file_info is None:
-            raise HTTPException(status_code=404, detail="文件ID不存在")
-        
-        # 重建处理状态
-        file_path, filename = file_info
-        processing_status[file_id] = ProcessingStatus(
-            file_id=file_id,
-            status="uploaded",
-            progress=100,
-            message="文件已上传（服务重启后恢复状态）"
-        )
-    
-    # 更新状态
-    processing_status[file_id].status = "parsing"
-    processing_status[file_id].progress = 10
-    processing_status[file_id].message = "正在解析文档..."
-    
-    # 查找文件
-    file_info = find_file_by_id(file_id)
-    if file_info is None:
-        raise HTTPException(status_code=404, detail="文件不存在")
-    
-    file_path, filename = file_info
-    
-    # 更新进度
-    processing_status[file_id].progress = 30
-    
-    # 根据文件类型解析
-    file_type = get_file_type(filename)
-    
-    if file_type == "pdf":
-        from ..utils.pdf_parser import parse_pdf_file
-        
-        # 解析PDF文件
-        pdf_content = parse_pdf_file(file_path, enable_ocr=enable_ocr)
-        
-        # 转换为JSON可序列化的格式
-        def ultra_clean_string(s):
-            if not isinstance(s, str):
-                return str(s) if s is not None else ""
-            
-            # 移除所有不可打印字符，只保留基本的ASCII和常见Unicode
-            cleaned = ""
-            for char in s:
-                code = ord(char)
-                if (32 <= code <= 126) or char in '\n\r\t' or (0x4e00 <= code <= 0x9fff):
-                    cleaned += char
-                elif code > 127:
-                    cleaned += char  # 保留Unicode字符
-            
-            return cleaned.strip()
-        
-        def deep_clean_data(obj):
-            if isinstance(obj, dict):
-                return {ultra_clean_string(k): deep_clean_data(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [deep_clean_data(item) for item in obj]
-            elif isinstance(obj, str):
-                return ultra_clean_string(obj)
-            else:
-                return obj
-        
-        # 转换PDFContent为字典格式
-        content_dict = {
-            "text": ultra_clean_string(pdf_content.text),
-            "page_count": pdf_content.page_count,
-            "metadata": deep_clean_data(pdf_content.metadata),
-            "images": deep_clean_data(pdf_content.images),
-            "has_forms": pdf_content.has_forms,
-            "tables": deep_clean_data(pdf_content.tables)
-        }
-        
-        # 更新状态
-        processing_status[file_id].status = "completed"
-        processing_status[file_id].progress = 100
-        processing_status[file_id].message = "文档解析完成"
-        processing_status[file_id].result = {
-            "content": content_dict,
-            "processing_time": 0.0  # 这里需要根据实际解析时间计算
-        }
-        
-        # 返回数据字典，不是JSONResponse
-        return {
-            "success": True,
-            "file_id": file_id,
-            "content": content_dict,
-            "processing_time": 0.0,
-            "message": "PDF 解析完成"
-        }
-        
-    else:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"暂不支持 {file_type} 文件类型的解析"
-        )
-
-@router.post("/parse/{file_id}")
-async def parse_document(file_id: str, enable_ocr: bool = True):
-    """
-    解析文档内容
-    
-    目前支持 PDF 文档解析，后续会扩展支持其他格式
-    """
+    # This is an internal helper, so direct exception handling might be less critical
+    # if the calling function handles them. However, adding some for robustness.
     try:
         # 检查文件ID，如果内存中没有则尝试恢复
         if file_id not in processing_status:
-            file_info = find_file_by_id(file_id)
-            if file_info is None:
-                raise HTTPException(status_code=404, detail="文件ID不存在")
+            file_info_tuple = find_file_by_id(file_id) # Renamed to avoid conflict
+            if file_info_tuple is None:
+                logger.error(f"File ID {file_id} not found by find_file_by_id in _parse_document_internal.")
+                raise HTTPException(status_code=404, detail="文件ID不存在 (internal find failed)")
             
             # 重建处理状态
-            file_path, filename = file_info
+            file_path, filename = file_info_tuple
             processing_status[file_id] = ProcessingStatus(
                 file_id=file_id,
-                status="uploaded",
-                progress=100,
-                message="文件已上传（服务重启后恢复状态）"
+                status="uploaded", # Or "unknown_recovered"
+                progress=0, # Reset progress
+                message="文件状态已恢复（可能在服务重启后）"
             )
         
         # 更新状态
@@ -424,11 +331,14 @@ async def parse_document(file_id: str, enable_ocr: bool = True):
         processing_status[file_id].message = "正在解析文档..."
         
         # 查找文件
-        file_info = find_file_by_id(file_id)
-        if file_info is None:
-            raise HTTPException(status_code=404, detail="文件不存在")
+        file_info_tuple_lookup = find_file_by_id(file_id) # Renamed
+        if file_info_tuple_lookup is None:
+            processing_status[file_id].status = "error"
+            processing_status[file_id].message = "文件物理路径未找到"
+            logger.error(f"Physical file for ID {file_id} not found during parsing attempt.")
+            raise HTTPException(status_code=404, detail="文件物理路径未找到")
         
-        file_path, filename = file_info
+        file_path, filename = file_info_tuple_lookup
         
         # 更新进度
         processing_status[file_id].progress = 30
@@ -437,94 +347,232 @@ async def parse_document(file_id: str, enable_ocr: bool = True):
         file_type = get_file_type(filename)
         
         if file_type == "pdf":
-            # 解析 PDF
-            import time
-            start_time = time.time()
+            from ..utils.pdf_parser import parse_pdf_file
             
-            content = await _parse_document_internal(file_id, enable_ocr)
-            processing_time = time.time() - start_time
+            # 解析PDF文件
+            pdf_content = parse_pdf_file(file_path, enable_ocr=enable_ocr)
             
-            # 更新状态
-            processing_status[file_id].status = "completed"
-            processing_status[file_id].progress = 100
-            processing_status[file_id].message = "文档解析完成"
-            processing_status[file_id].result = {
-                "content": content["content"],
-                "processing_time": processing_time
+            # 转换为JSON可序列化的格式
+            def ultra_clean_string(s):
+                if not isinstance(s, str):
+                    return str(s) if s is not None else ""
+
+                cleaned = ""
+                for char in s:
+                    code = ord(char)
+                    # Allow basic printable ASCII, common whitespace, and CJK Unified Ideographs
+                    if (32 <= code <= 126) or char in '\n\r\t' or \
+                       (0x4e00 <= code <= 0x9fff) or \
+                       (0x3000 <= code <= 0x303f) or \
+                       (0xff00 <= code <= 0xffef): # Added CJK Symbols/Punctuation and Fullwidth forms
+                        cleaned += char
+                    elif code > 127: # Keep other Unicode characters too for now
+                        cleaned += char
+                return cleaned.strip()
+
+            def deep_clean_data(obj):
+                if isinstance(obj, dict):
+                    return {ultra_clean_string(str(k)): deep_clean_data(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [deep_clean_data(item) for item in obj]
+                elif isinstance(obj, str):
+                    return ultra_clean_string(obj)
+                else:
+                    return obj # Keep non-string, non-dict, non-list as is
+
+            content_dict = {
+                "text": ultra_clean_string(pdf_content.text),
+                "page_count": pdf_content.page_count,
+                "metadata": deep_clean_data(pdf_content.metadata),
+                "images": deep_clean_data(pdf_content.images), # Images list might contain complex objects
+                "has_forms": pdf_content.has_forms,
+                "tables": deep_clean_data(pdf_content.tables) # Tables list
             }
             
-            # 使用JSONResponse避免Pydantic自动序列化
-            from fastapi.responses import JSONResponse
-            return JSONResponse(content=content)
+            # 更新状态
+            # This status update should ideally be in the calling function after success
+            # processing_status[file_id].status = "completed"
+            # processing_status[file_id].progress = 100
+            # processing_status[file_id].message = "文档解析完成"
+            # processing_status[file_id].result = {
+            #     "content": content_dict,
+            #     "processing_time": 0.0
+            # }
+
+            return {
+                "success": True,
+                "file_id": file_id,
+                "content": content_dict, # This is the PDFContent model data, not yet JSON
+                "message": "PDF 解析完成"
+            }
             
         else:
+            logger.warning(f"Unsupported file type '{file_type}' for parsing in _parse_document_internal for file_id '{file_id}'.")
             raise HTTPException(
                 status_code=400, 
                 detail=f"暂不支持 {file_type} 文件类型的解析"
             )
-    
-    except HTTPException:
-        # 更新错误状态
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException in _parse_document_internal for {file_id}: {http_exc.detail}", exc_info=True)
         if file_id in processing_status:
             processing_status[file_id].status = "error"
-            processing_status[file_id].message = "文档解析失败"
+            processing_status[file_id].message = f"内部解析错误: {http_exc.detail}"
         raise
     except Exception as e:
-        # 更新错误状态
+        logger.error(f"Unexpected error in _parse_document_internal for {file_id}", exc_info=True)
         if file_id in processing_status:
             processing_status[file_id].status = "error"
-            processing_status[file_id].message = f"解析失败: {str(e)}"
-        
-        logger.error(f"文档解析失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"文档解析失败: {str(e)}")
+            processing_status[file_id].message = f"内部解析意外失败: {str(e)}"
+        # Re-raise as a generic 500 if it's not an HTTPException already
+        raise HTTPException(status_code=500, detail=f"内部解析意外失败: {str(e)}")
 
 
-async def build_knowledge_graph_background(file_id: str, pdf_content: PDFContent, filename: str):
-    """后台任务：构建知识图谱"""
+@router.post("/parse/{file_id}")
+async def parse_document(file_id: str, enable_ocr: bool = True):
+    """
+    解析文档内容
+
+    目前支持 PDF 文档解析，后续会扩展支持其他格式
+    """
+    start_time = datetime.now()
     try:
-        # 更新状态
+        # Initial status check and setup (simplified from original as _parse_document_internal handles some of this)
+        doc_info_db = get_document_info(file_id)
+        if not doc_info_db:
+            logger.warning(f"Parse requested for non-existent file_id in DB: {file_id}")
+            raise HTTPException(status_code=404, detail="文件ID在数据库中不存在")
+
+        if file_id not in processing_status:
+             processing_status[file_id] = ProcessingStatus(
+                file_id=file_id, status="pending_parse", progress=0, message="解析任务已创建"
+            )
+
+        processing_status[file_id].status = "parsing"
+        processing_status[file_id].progress = 10
+        processing_status[file_id].message = "正在解析文档..."
+
+        # Call internal parsing logic
+        parsed_data = await _parse_document_internal(file_id, enable_ocr)
+
+        processing_time_seconds = (datetime.now() - start_time).total_seconds()
+        
+        # Update status upon successful parsing
+        processing_status[file_id].status = "parsed_successfully" # More specific status
+        processing_status[file_id].progress = 100
+        processing_status[file_id].message = "文档解析成功完成"
+        # parsed_data["content"] is already a dict from _parse_document_internal
+        processing_status[file_id].result = {
+            "content_summary": {
+                "page_count": parsed_data["content"]["page_count"],
+                "text_length": len(parsed_data["content"]["text"]),
+                "num_images": len(parsed_data["content"]["images"]),
+                "num_tables": len(parsed_data["content"]["tables"]),
+            },
+            "processing_time": processing_time_seconds
+        }
+
+        # Update DB status
+        update_document_status(file_id, "parsed_successfully", processed_at=datetime.now())
+
+        # Return the actual parsed content along with success metrics
+        # The PDFContent model fields might not be directly serializable by Pydantic if they contain complex types
+        # _parse_document_internal now returns a dict, so this should be fine.
+        final_response_content = {
+            "success": True,
+            "file_id": file_id,
+            "content": parsed_data["content"], # This is the cleaned dict
+            "processing_time": processing_time_seconds,
+            "message": "文档解析成功完成"
+        }
+        return JSONResponse(content=final_response_content) # Ensure it's JSON serializable
+
+    except HTTPException as http_exc:
+        logger.warning(f"HTTPException during parsing for file_id '{file_id}': {http_exc.detail}")
+        if file_id in processing_status:
+            processing_status[file_id].status = "error_parsing"
+            processing_status[file_id].message = f"文档解析失败: {http_exc.detail}"
+        update_document_status(file_id, "error_parsing", error_message=http_exc.detail)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during parsing for file_id '{file_id}'", exc_info=True)
+        if file_id in processing_status:
+            processing_status[file_id].status = "error_parsing"
+            processing_status[file_id].message = f"文档解析意外失败: {str(e)}"
+        update_document_status(file_id, "error_parsing", error_message=str(e))
+        raise HTTPException(status_code=500, detail=f"服务器内部错误，文档解析失败。")
+
+
+async def build_knowledge_graph_background(file_id: str, pdf_content_dict: Dict[str, Any], filename: str):
+    """后台任务：构建知识图谱. Takes dict instead of PDFContent model."""
+    try:
+        # Ensure status exists for file_id
+        if file_id not in processing_status:
+            processing_status[file_id] = ProcessingStatus(
+                file_id=file_id, status="unknown", progress=0, message="BG task started for unknown file"
+            )
+
         processing_status[file_id].status = "building_graph"
-        processing_status[file_id].progress = 50
+        processing_status[file_id].progress = 50 # Arbitrary progress for KG build start
         processing_status[file_id].message = "正在构建知识图谱..."
+        update_document_status(file_id, "building_graph")
         
-        # 获取 Graphiti 服务
         graphiti_service = get_graphiti_service()
-        
-        # 构建知识图谱
-        result = await graphiti_service.build_knowledge_graph_from_pdf(
-            pdf_content=pdf_content,
-            document_name=filename
+        if not graphiti_service or not graphiti_service.is_available():
+            logger.error(f"Graphiti service not available for KG build for file_id {file_id}.")
+            raise Exception("Graphiti服务不可用或未初始化")
+
+        # Reconstruct PDFContent from dict for graphiti_service if it expects the model
+        # For now, graphiti_service.build_knowledge_graph_from_pdf expects PDFContent model
+        # but build_knowledge_graph expects text. We need to align this.
+        # The current `build_knowledge_graph_from_pdf` in graphiti_service.py takes text chunks.
+        # Let's assume for now the background task gets the text directly.
+        # The `process_pdf_document` calls `graphiti_service.build_knowledge_graph` with text.
+        # This `build_knowledge_graph_background` seems to be part of an older flow or needs text.
+        # Re-aligning: this function should receive text, not a PDFContent object/dict.
+        # However, the caller `process_document_background` -> `process_pdf_document` calls
+        # `graphiti_service.build_knowledge_graph(text=pdf_content.text, ...)`
+        # So this `build_knowledge_graph_background` might be unused or needs refactoring.
+        # For now, let's assume it gets the text it needs from `pdf_content_dict['text']`.
+
+        text_to_process = pdf_content_dict.get("text")
+        if not text_to_process:
+            logger.error(f"No text found in pdf_content_dict for KG build of {file_id}")
+            raise ValueError("Text content is missing for knowledge graph construction.")
+
+        # This call is problematic as build_knowledge_graph_from_pdf expects PDFContent model
+        # and build_knowledge_graph expects just text.
+        # Let's use the direct text method:
+        result_dict = await graphiti_service.build_knowledge_graph(
+            text=text_to_process, # Pass the text
+            document_id=file_id # document_id is used as episode_name prefix
         )
         
-        # 更新最终状态
-        processing_status[file_id].status = "completed"
-        processing_status[file_id].progress = 100
-        processing_status[file_id].message = "知识图谱构建完成"
-        processing_status[file_id].result.update({
-            "knowledge_graph": result.dict()
-        })
+        # Convert result (which is a dict) to KnowledgeGraphResult if needed, or handle dict directly
+        # The current result_dict is already a dict with success, counts, etc.
         
-        # 更新持久化存储中的文档信息
-        documents = load_documents_db()
-        if file_id in documents:
-            documents[file_id].status = "completed"
-            documents[file_id].processed_at = datetime.now()
-            documents[file_id].node_count = result.entity_count if result.success else 0
-            documents[file_id].error_message = None
-            save_documents_db(documents)
-            logger.info(f"✅ 文档 {filename} 处理完成，生成节点: {result.entity_count}")
+        current_time = datetime.now()
+        if result_dict.get("success"):
+            processing_status[file_id].status = "completed"
+            processing_status[file_id].message = "知识图谱构建完成"
+            node_count = result_dict.get("actual_created_entities", 0) # Or total_graph_nodes
+            update_document_status(file_id, "completed", processed_at=current_time, node_count=node_count, error_message=None)
+            logger.info(f"✅ 文档 {filename} (ID: {file_id}) 知识图谱构建完成，节点数: {node_count}")
+        else:
+            error_msg = result_dict.get("error", "知识图谱构建未知错误")
+            processing_status[file_id].status = "error_kg_build"
+            processing_status[file_id].message = f"知识图谱构建失败: {error_msg}"
+            update_document_status(file_id, "error_kg_build", processed_at=current_time, error_message=error_msg)
+            logger.error(f"❌ 文档 {filename} (ID: {file_id}) 知识图谱构建失败: {error_msg}")
+
+        processing_status[file_id].progress = 100
+        # processing_status[file_id].result.update({"knowledge_graph": result_dict}) # Store full result if needed
         
     except Exception as e:
-        logger.error(f"知识图谱构建失败: {str(e)}")
-        processing_status[file_id].status = "error"
-        processing_status[file_id].message = f"知识图谱构建失败: {str(e)}"
-        
-        # 更新持久化存储中的错误状态
-        documents = load_documents_db()
-        if file_id in documents:
-            documents[file_id].status = "error"
-            documents[file_id].error_message = str(e)
-            save_documents_db(documents)
+        logger.error(f"知识图谱后台构建失败 for file_id {file_id}: {str(e)}", exc_info=True)
+        if file_id in processing_status: # Check again in case it was cleared
+            processing_status[file_id].status = "error_kg_build"
+            processing_status[file_id].message = f"知识图谱构建异常: {str(e)}"
+        update_document_status(file_id, "error_kg_build", processed_at=datetime.now(), error_message=str(e))
 
 
 @router.post("/process/{file_id}")
@@ -804,44 +852,46 @@ async def get_document_stats():
     try:
         documents = load_documents_db()
         
-        # 统计各种状态的文档
         total_documents = len(documents)
+        # Refined status checking for more accuracy
         processed_documents = len([doc for doc in documents.values() if doc.status == "completed"])
-        processing_documents = len([doc for doc in documents.values() if doc.status in ["parsing", "building_graph"]])
-        failed_documents = len([doc for doc in documents.values() if doc.status == "error"])
+        processing_documents = len([doc for doc in documents.values() if doc.status in ["processing", "parsing", "building_graph", "processing_queued"]])
+        # Consider various failure states
+        failed_documents = len([doc for doc in documents.values() if "fail" in doc.status or "error" in doc.status])
         
-        # 统计节点数量
-        total_nodes = sum(doc.node_count for doc in documents.values())
+        total_nodes = sum(doc.node_count for doc in documents.values() if isinstance(doc.node_count, int))
         
-        # 统计文件类型
-        file_types = {}
+        file_types_counts = {}
         for doc in documents.values():
-            file_types[doc.file_type] = file_types.get(doc.file_type, 0) + 1
+            file_types_counts[doc.file_type] = file_types_counts.get(doc.file_type, 0) + 1
         
-        # 计算总文件大小
-        total_size = sum(doc.file_size for doc in documents.values())
+        total_size_bytes_val = sum(doc.file_size for doc in documents.values() if isinstance(doc.file_size, int))
         
+        # Placeholder for relations, actual count should come from graph_stats if available
+        # This is a very rough estimate and might be misleading.
+        # Consider linking this to graphiti_service.get_graph_stats() if a global stat is needed.
+        estimated_total_relations = total_nodes * 2
+
         return {
             "total_documents": total_documents,
             "processed_documents": processed_documents,
             "processing_documents": processing_documents,
             "failed_documents": failed_documents,
-            "total_nodes": total_nodes,
-            "total_relations": total_nodes * 2 if total_nodes > 0 else 0,  # 估算关系数
-            "file_types": file_types,
-            "total_size_bytes": total_size,
-            "total_size_mb": round(total_size / 1024 / 1024, 2)
+            "total_extracted_nodes": total_nodes, # Renamed for clarity
+            "estimated_total_relations": estimated_total_relations,
+            "file_types": file_types_counts,
+            "total_size_bytes": total_size_bytes_val,
+            "total_size_mb": round(total_size_bytes_val / (1024 * 1024), 2) if total_size_bytes_val else 0.0
         }
     except Exception as e:
-        logger.error(f"获取统计信息失败: {e}")
+        logger.error("获取文档统计信息失败", exc_info=True)
+        # Return a more structured error response or raise HTTPException
+        # For now, returning empty/zeroed stats as per original logic, but this could be an HTTPException too.
+        # raise HTTPException(status_code=500, detail="服务器内部错误，获取文档统计信息失败。")
+        # Keeping original return type for now:
         return {
-            "total_documents": 0,
-            "processed_documents": 0,
-            "processing_documents": 0,
-            "failed_documents": 0,
-            "total_nodes": 0,
-            "total_relations": 0,
-            "file_types": {},
-            "total_size_bytes": 0,
-            "total_size_mb": 0
-        } 
+            "total_documents": 0, "processed_documents": 0, "processing_documents": 0,
+            "failed_documents": 0, "total_extracted_nodes": 0, "estimated_total_relations": 0,
+            "file_types": {}, "total_size_bytes": 0, "total_size_mb": 0.0,
+            "error": "Failed to retrieve statistics." # Added error field
+        }

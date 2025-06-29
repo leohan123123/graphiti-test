@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
     logger.info("应用启动完成 - Lifespan Startup")
     yield
     # Shutdown
-    logger.info("应用正在关闭... - Lifespan Shutdown")
+    logger.info("应用正在关闭...") # Adjusted to match user's requested log message
 
 
 # 创建 FastAPI 应用
@@ -179,38 +179,55 @@ async def get_app_info():
 if __name__ == "__main__":
     import uvicorn
 
-    def is_port_in_use(port: int, host: str) -> bool:
-        """检查指定端口是否被占用"""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    def find_available_port(host: str, start_port: int, max_attempts: int = 10) -> Optional[int]:
+        """Tries to find an available port by binding to it."""
+        for port_candidate in range(start_port, start_port + max_attempts):
             try:
-                s.bind((host, port))
-                return False  # Port is available
-            except socket.error as e:
-                logger.warning(f"端口 {port} 在主机 {host} 上已被占用或发生错误: {e}")
-                return True # Port is in use or other error
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind((host, port_candidate))
+                logger.info(f"端口 {port_candidate} 在主机 {host} 上可用.")
+                return port_candidate
+            except OSError as e:
+                logger.warning(f"端口 {port_candidate} 在主机 {host} 上已被占用或发生错误: {e}")
+                continue
+        return None
 
-    port_to_use = settings.PORT
     host_to_use = settings.HOST
+    # Try default port first, then iterate through a range based on settings.PORT as start
+    # The user's example uses a fixed start_port=8000 and max_attempts=10.
+    # We can make this configurable via settings if needed, or combine with RETRY_PORTS.
+    # For now, let's try the main port, then a sequence.
 
-    if is_port_in_use(port_to_use, host_to_use):
-        logger.info(f"默认端口 {port_to_use} 在主机 {host_to_use} 上已被占用. 尝试备用端口...")
-        found_available_port = False
-        for retry_port in settings.RETRY_PORTS:
-            if not is_port_in_use(retry_port, host_to_use):
-                port_to_use = retry_port
-                found_available_port = True
-                logger.info(f"找到可用端口: {port_to_use} 在主机 {host_to_use} 上")
-                break
+    port_to_use = None
+    # Check initial port from settings
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host_to_use, settings.PORT))
+        port_to_use = settings.PORT
+        logger.info(f"默认端口 {settings.PORT} 在主机 {host_to_use} 上可用.")
+    except OSError:
+        logger.warning(f"默认端口 {settings.PORT} 在主机 {host_to_use} 上已被占用. 尝试备用端口...")
+        # Define a range for trying alternative ports if default is taken
+        # This replaces the direct use of settings.RETRY_PORTS with a range logic
+        # Max attempts for finding an alternative if default is taken.
+        # Start searching from settings.PORT + 1
+        alternative_start_port = settings.PORT + 1
+        # Let's use a reasonable number of attempts, e.g., 10, as in user's example.
+        # Or, could use len(settings.RETRY_PORTS) if we want to keep that configurable.
+        # For simplicity, let's use a fixed number of attempts for alternatives.
+        max_alt_attempts = 10
+        port_to_use = find_available_port(host_to_use, alternative_start_port, max_alt_attempts)
 
-        if not found_available_port:
-            logger.error(f"在主机 {host_to_use} 上所有指定端口 ({settings.PORT} 和 {settings.RETRY_PORTS}) 都已被占用. 应用无法启动.")
-            sys.exit(1) # Exit if no port is available
-    else:
-        logger.info(f"默认端口 {port_to_use} 在主机 {host_to_use} 上可用.")
+    if port_to_use is None:
+        logger.error(
+            f"在主机 {host_to_use} 上无法找到可用端口 (尝试了从 {settings.PORT} 开始的端口). "
+            "应用无法启动."
+        )
+        sys.exit(1)
 
     logger.info(f"启动 Uvicorn 服务于 {host_to_use}:{port_to_use}")
     uvicorn.run(
-        "app.main:app",
+        "app.main:app",  # Points to the app instance in the current file
         host=host_to_use,
         port=port_to_use,
         reload=settings.DEBUG,
